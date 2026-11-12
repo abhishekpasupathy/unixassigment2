@@ -112,7 +112,7 @@ The special payload `CRASH` is a deliberate demonstration hook. The selected wor
 Run the complete demonstration:
 
 ```bash
-./demo.sh
+sh demo.sh
 ```
 
 Expected behavior:
