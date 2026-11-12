@@ -1,170 +1,229 @@
 # System V Message-Queue Router with Request Isolation
 
-A C implementation of a multi-class request router using **System V IPC message queues**. The router accepts requests from standard and priority clients, validates the protocol, forwards each request to its matching worker queue, and returns the result to the requesting client using a private reply queue and a unique request ID.
+A single-file C implementation of a multi-client-class router built with **System V IPC message queues**. It routes standard, priority and batch requests to independent worker processes, correlates every response with a request ID, validates untrusted messages, tracks per-client statistics and contains worker failures.
 
 ## Features
 
-- Separate routing paths for `STANDARD` and `PRIORITY` client classes.
-- System V queues created and accessed with `msgget()`, `msgsnd()` and `msgrcv()`.
-- Request protocol validation: message length, magic value, protocol version, client class, request ID, reply queue ID, payload length and terminating NUL byte.
-- Request isolation: every client creates a private reply queue; every response carries the originating request ID. A client accepts only the response matching its own ID.
-- Non-blocking queue operations so a full worker queue is reported instead of blocking the router.
-- Explicit handling for full queues (`EAGAIN`), removed/invalid queues (`EIDRM`/`EINVAL`), and delivery failures.
-- Per-client-class counters for received, forwarded, completed, rejected and failed requests.
-- Worker supervision using `waitpid()`. An unexpected worker exit disables only that class; the other class continues working.
-- Graceful router shutdown removes all queues owned by the router.
+- Three independently supervised worker classes: `STANDARD`, `PRIORITY` and `BATCH`.
+- The request queue's System V `mtype` identifies the client class: `1 = STANDARD`, `2 = PRIORITY`, `3 = BATCH`.
+- Priority requests are polled by their exact type before the router uses a negative `msgtyp` to drain the remaining known classes. This preserves the requested type numbers while respecting System V selection semantics (a negative `msgtyp` selects the *lowest* message type not greater than its absolute value).
+- Unexpected positive message types are consumed by a final type-zero receive and rejected instead of remaining stuck in the queue.
+- Validation of message length, magic, protocol version, type/class agreement, client PID, request ID, reply queue ID, payload length and NUL termination.
+- Request isolation through a router-owned pending table keyed by request ID. Worker responses do not carry a reply-queue ID; the router looks up the original reply queue and client PID in that table.
+- Non-blocking queue sends, explicit `QUEUE_FULL` and `QUEUE_REMOVED` handling, and a bounded client response timeout.
+- Per-client statistics keyed by client PID: received, forwarded, completed, rejected and failed. Unidentifiable malformed messages increment a separate global counter.
+- `SIGUSR1` prints a live statistics snapshot. `Ctrl+C` or `SIGTERM` performs graceful shutdown.
+- Worker supervision with `waitpid()`. A worker exit fails all pending requests assigned to that worker; only that class is disabled.
+- `SLOW` test payload to hold a worker for two seconds and make queue saturation reproducible.
+- `prctl(PR_SET_PDEATHSIG, SIGTERM)` in each worker. If the router is killed with `SIGKILL`, workers remove their own queue and the shared request/response queues before exiting.
+- IPC permissions are restricted to `0600`.
 
 ## Architecture
 
 ```text
-                    System V IPC message queues
-
- +------------------+       +--------------------------+
- | STANDARD client  |------>|                          |
- | private reply Q  |<------+                          |
- +------------------+       |                          |
-                            |       ROUTER PROCESS      |
- +------------------+       |                          |
- | PRIORITY client  |------>|  validate + classify     |
- | private reply Q  |<------+  route + account stats   |
- +------------------+       |                          |
-                            +------------+-------------+
-                                         |
-                         +---------------+---------------+
-                         |                               |
-                  standard queue                  priority queue
-                         |                               |
-                  +------v------+                 +------v------+
-                  | STANDARD    |                 | PRIORITY    |
-                  | WORKER      |                 | WORKER      |
-                  +------+------+                 +------+------+
-                         |                               |
-                         +---------------+---------------+
-                                         |
-                                  response queue
-                                         |
-                                  Router matches
-                                  request ID and
-                                  reply queue ID
-                                         |
-                              private client reply queue
+                      REQUEST QUEUE (mtype = class)
+ +----------------+    +-----------------------------------------+
+ | STANDARD client|--->| mtype 1                                  |
+ | private reply Q|<---|                                         |
+ +----------------+    |                                         |
+                       |              ROUTER                     |
+ +----------------+    | validate -> route -> pending table      |
+ | PRIORITY client|--->| mtype 2                                  |
+ | private reply Q|<---|                                         |
+ +----------------+    |                                         |
+                       |                                         |
+ +----------------+    | mtype 3                                  |
+ | BATCH client   |--->|                                         |
+ | private reply Q|<---|                                         |
+ +----------------+    +--------------------+--------------------+
+                                            |
+                   +------------------------+-----------------------+
+                   |                        |                       |
+             STANDARD Q                PRIORITY Q                BATCH Q
+                   |                        |                       |
+             +-----v------+           +-----v------+           +----v-------+
+             | STD worker |           | PRI worker |           | BATCH worker|
+             +-----+------+           +-----+------+           +-----+------+
+                   |                        |                       |
+                   +------------------------+-----------------------+
+                                            |
+                                     RESPONSE QUEUE
+                                            |
+                                 router matches request ID
+                                 to pending-table entry
+                                            |
+                                  original private reply Q
 ```
 
-### Request lifecycle
+### Request and response lifecycle
 
-1. A client connects to the router's well-known request queue.
-2. The client creates a private reply queue with `IPC_PRIVATE` and generates a request ID.
-3. The router receives and validates the complete request structure.
-4. The router selects the worker queue from the client class and forwards the request without blocking.
-5. The worker processes the request and sends a response to the router's response queue.
-6. The router forwards that response to the reply queue supplied by the originating client.
-7. The client verifies the request ID before displaying the response and removes its private queue.
+1. A client opens the well-known router queue and creates a private reply queue with `IPC_PRIVATE`.
+2. It sends a request whose `mtype` identifies its class and whose body contains the same class ID, client PID, request ID, reply queue ID and validated payload metadata.
+3. The router receives priority type `2` first. It then uses `msgrcv(..., -max_type, ...)` to drain the lowest remaining known type, and a type-zero receive to consume any unexpected type.
+4. The router validates the message, reserves a pending-table entry keyed by request ID, and forwards the work to the selected worker queue.
+5. The worker returns only the class and request ID on the response queue. It cannot choose or replace the destination reply queue.
+6. The router finds the pending entry and sends the response to the reply queue recorded when that request was accepted. The pending entry is then cleared.
+7. The client checks both the protocol marker and its request ID before accepting the response, then removes its private queue.
+
+### Why priority is polled separately
+
+System V `msgrcv()` with a negative `msgtyp` selects the message with the **lowest** type value that is less than or equal to the absolute value. With the required mapping (`1 = STANDARD`, `2 = PRIORITY`, `3 = BATCH`), a single `msgtyp = -3` call would select standard before priority. The router therefore polls exact type `2` first, then uses the negative receive for the remaining class types. This gives priority requests precedence without changing the specified type assignments.
 
 ## Project structure
 
 ```text
 unixassigment2/
-├── mq_router.c   # Router, worker and client processes; shared IPC protocol
-├── Makefile      # Build and clean targets
-├── demo.sh       # End-to-end routing and worker-failure demonstration
-└── README.md     # Documentation
+├── mq_router.c   # Router, worker processes, clients, protocol and test command
+├── Makefile      # Build, test, demo, ASan/UBSan and clean targets
+├── demo.sh       # End-to-end queue, permission and worker-failure demonstration
+└── README.md     # Architecture, protocol and operating instructions
 ```
 
 ## Requirements
 
-- Linux or a Unix-like operating system providing System V IPC.
-- GCC or another C11-compatible compiler.
-- `make`.
+- Linux with System V IPC and `prctl(PR_SET_PDEATHSIG)`.
+- GCC with C11 support.
+- `make`, `ipcrm`, `xargs`; the permission demonstration additionally uses `runuser` and a `nobody` account.
 
-## Compile
+## Build
 
 ```bash
 make
 ```
 
-Equivalent direct compilation:
+The default build uses warnings as errors:
 
 ```bash
-gcc -std=c11 -Wall -Wextra -Wpedantic -O2 -o mq_router mq_router.c
+gcc -std=c11 -Wall -Wextra -Wpedantic -Werror -O2 -o mq_router mq_router.c
 ```
 
-## Run
+AddressSanitizer and UndefinedBehaviorSanitizer build:
 
-Open terminal 1 and start the router:
+```bash
+make asan
+ASAN_OPTIONS=detect_leaks=0 ./mq_router_asan router
+```
+
+## Run manually
+
+Start the router in terminal 1:
 
 ```bash
 ./mq_router router
 ```
 
-Open terminal 2 (or additional terminals) and submit requests:
+It prints its PID, request queue ID, response queue ID, and each worker's PID, queue ID and message type. In terminal 2:
 
 ```bash
 ./mq_router client standard "Generate monthly report"
 ./mq_router client priority "Process urgent payment"
+./mq_router client batch "Archive daily records"
 ```
 
-The router prints routing events and a per-class statistics summary when stopped with `Ctrl+C`.
-
-## Demonstrate an unexpected worker exit
-
-The special payload `CRASH` is a deliberate demonstration hook. The selected worker consumes the request and exits immediately without returning a response. The router reaps the child, reports the failure and marks only that worker class unavailable.
-
-Run the complete demonstration:
+A worker's `SLOW` payload sleeps for two seconds and is intended for queue-pressure demonstrations:
 
 ```bash
-sh demo.sh
+./mq_router client standard SLOW
 ```
 
-Expected behavior:
+### Statistics
 
-1. A standard request is processed by the standard worker.
-2. A priority request is processed by the priority worker.
-3. A standard `CRASH` request causes the standard worker to exit; its client times out because no response is produced.
-4. A later standard request receives `WORKER_UNAVAILABLE` from the router.
-5. A priority request still succeeds, proving failure isolation between worker classes.
+Send `SIGUSR1` to the router PID shown at startup:
 
-The demo writes router output to `router.log` and prints it at the end.
+```bash
+kill -USR1 <router-pid>
+```
+
+The router prints one row per client PID with `received`, `forwarded`, `completed`, `rejected` and `failed` counters, plus `unidentified_rejections`. The same report is printed during shutdown.
+
+### Malformed-message tests
+
+With the router running, execute:
+
+```bash
+./mq_router test
+```
+
+The command submits seven deliberately invalid messages and waits for the router's rejection responses:
+
+1. Wrong magic value.
+2. Wrong protocol version.
+3. Unknown class ID.
+4. Short message.
+5. Oversized message.
+6. Missing NUL terminator.
+7. Unexpected message type (`mtype = 99`).
+
+The test command prints a confirmation for each rejection received. The router also logs the reason; the unexpected message type increments the global unidentified-rejection counter.
+
+## Complete demonstration
+
+Run:
+
+```bash
+make demo
+```
+
+`demo.sh` performs these steps in order:
+
+1. Successfully routes one standard, one priority and one batch request.
+2. Runs all seven malformed-message cases.
+3. If run as root with `runuser`, attempts a client request as `nobody` and demonstrates `EACCES` against the mode-`0600` router queue.
+4. Starts a `SLOW` standard request, then launches 120 concurrent clients. The small worker queue fills and excess clients receive `QUEUE_FULL`; accepted requests finish normally.
+5. Removes the batch worker queue with `ipcrm -q`. The router reports `QUEUE_REMOVED` for that class while standard and priority continue to work.
+6. Starts a `SLOW` priority request, reads the priority worker PID from the router log, and kills that worker externally with `kill -9`. The in-flight request receives `WORKER_FAILED`; later priority requests receive `WORKER_UNAVAILABLE`.
+7. Confirms standard still works, requests a final statistics snapshot with `SIGUSR1`, then shuts down the router.
+
+The demo writes `router.log`, `queue-full.log` and supporting test logs. `make clean` removes the executable, sanitizer executable and generated logs.
 
 ## Error handling
 
-| Condition | Handling |
+| Condition | Router/client behavior |
 |---|---|
-| Invalid structure, protocol marker/version, class, request ID, or payload | Reject request; increment rejected counter when class can be identified |
-| Payload is empty or exceeds the fixed protocol buffer | Client rejects it before sending; router independently validates payload length |
-| Worker queue is full (`EAGAIN`) | Non-blocking send fails; router returns `QUEUE_FULL` |
-| Worker queue was removed or became invalid (`EIDRM` / `EINVAL`) | Router returns a queue error rather than waiting indefinitely |
-| Worker process exits | Router detects it with `waitpid(WNOHANG)` and disables that class |
-| Client reply queue was removed | Router logs response-delivery failure; other requests continue |
-| Client receives no response | Client times out after 10 seconds and removes its private reply queue |
+| Short, oversized, malformed or invalid protocol message | Receive buffer has one extra byte; message is rejected without writing beyond the buffer. The test command exercises both size boundaries. |
+| Wrong magic/version, class mismatch, invalid payload or missing NUL | Reject and increment the identifiable client's rejected counter. |
+| Unknown `mtype` | Consume with the type-zero receive, reject, and increment `unidentified_rejections` if the client class cannot be identified. |
+| Worker queue full (`EAGAIN`) | Return `QUEUE_FULL`; the router does not block waiting for queue capacity. |
+| Worker queue removed (`EIDRM` / `EINVAL`) | Mark that class unavailable and return `QUEUE_REMOVED`. |
+| Worker exits unexpectedly | `waitpid(WNOHANG)` detects the exit; every pending request for that class receives `WORKER_FAILED`; later requests receive `WORKER_UNAVAILABLE`. Other classes remain available. |
+| Client reply queue removed | Router logs delivery failure and clears the pending entry; other clients continue. |
+| Client receives no response | Client times out after 12 seconds and removes its private reply queue. |
+| Router killed with `SIGKILL` | Workers receive `SIGTERM` through `PR_SET_PDEATHSIG`; each worker removes its own queue and the shared request/response queues before exiting. |
+| Queue access from another user | Mode `0600` prevents access; `msgget()` fails with `EACCES`. |
 
 ## IPC design and permissions
 
-- Router request queue: fixed key `0x52545232`, permissions `0600`.
-- Worker input queues and router response queue: private queues created with `IPC_PRIVATE`, permissions `0600`.
-- Client reply queues: private queues created with `IPC_PRIVATE`, permissions `0600`.
-- The message `mtype` is always positive. The implementation uses a dedicated message type for each protocol queue and carries the request ID in the message body for explicit correlation.
-- The router owns and removes its request, worker and response queues on graceful shutdown. Each client removes its own private reply queue.
+| Queue | Creation | Permissions | Purpose |
+|---|---|---:|---|
+| Router request queue | Fixed key `0x52545232` with `IPC_CREAT | IPC_EXCL` | `0600` | Client-to-router requests; `mtype` is the client class. |
+| Worker input queues | `IPC_PRIVATE` | `0600` | One independent queue per worker class. Queue capacity is set to 1024 bytes for a repeatable full-queue demonstration. |
+| Router response queue | `IPC_PRIVATE` | `0600` | Worker-to-router responses. |
+| Client reply queues | `IPC_PRIVATE` | `0600` | Private destination for each client request. |
+
+The router removes its owned queues with `msgctl(..., IPC_RMID, ...)` during graceful shutdown. Each client removes its own reply queue. Workers also clean up their IPC queues on parent death, covering the `SIGKILL` case. Worker and response queue IDs are printed at startup to support manual inspection and recovery.
 
 ## Cleanup
 
-Stop the router with `Ctrl+C`. If a previous run was terminated forcefully and left the well-known request queue behind, run:
+Graceful shutdown:
+
+```bash
+kill -TERM <router-pid>
+```
+
+Remove a stale well-known request queue when no router is active:
 
 ```bash
 ./mq_router cleanup
 ```
 
-This removes only the well-known router request queue. It does not terminate a still-running router process; stop any active router before starting another one.
+If the host terminates the router and all its workers before their parent-death handlers can run, inspect remaining queues with `ipcs -q` and remove an individual queue by ID using `ipcrm -q <queue-id>`.
 
 ## Learning outcomes covered
 
 - **CO4 / CO5:** Inter-process communication, process coordination, error handling and fault isolation.
 - **PO2:** Analyze and validate incoming requests.
-- **PO3:** Design a modular routing solution.
-- **PO5:** Apply System V IPC and Unix process-management tools.
+- **PO3:** Design a modular, table-driven routing solution.
+- **PO5:** Apply System V IPC, message types, permissions and Unix process-management tools.
 - **PO9:** Demonstrate independent client/worker interaction and coordination.
 - **SDG 9:** Reliable infrastructure through queue-based routing and failure handling.
 - **SDG 16:** Controlled access through IPC permissions, validation and isolation.
-
-## Notes
-
-This is an educational single-router demonstration. Request IDs are generated per client process and are used for response correlation; they are not a durable distributed transaction identifier. The fixed router key allows local clients to discover the router and should be changed if multiple independent instances must run under the same IPC namespace.
