@@ -633,7 +633,7 @@ All project queues are created with restrictive permissions: **`0600`**.
 
 | Queue | Creation | Purpose |
 |---|---|---|
-| Router request queue | Fixed key `0x52545232`, `IPC_CREAT | IPC_EXCL` | Client-to-router requests |
+| Router request queue | Fixed key `0x52545232`, created with `IPC_CREAT` and `IPC_EXCL` | Client-to-router requests |
 | Standard worker queue | `IPC_PRIVATE` | Standard work |
 | Priority worker queue | `IPC_PRIVATE` | Priority work |
 | Batch worker queue | `IPC_PRIVATE` | Batch work |
