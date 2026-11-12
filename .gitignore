@@ -1,3 +1,10 @@
 mq_router
-router.log
+mq_router_asan
 *.o
+router.log
+queue-full.log
+permission.log
+removed.log
+unavailable.log
+crash-client.log
+slow-client.log
